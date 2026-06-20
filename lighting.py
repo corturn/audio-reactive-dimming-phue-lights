@@ -9,6 +9,17 @@ load_dotenv()
 # Initialize Bridge
 b = Bridge(os.getenv("BRIDGE_IP"))
 
+# --- NEW: Print all connected lights ---
+print("Connected lights found on the bridge:")
+try:
+    for light in b.lights:
+        status = "ON" if light.on else "OFF"
+        print(f"  [ID: {light.light_id}] {light.name} - Currently {status}")
+except Exception as e:
+    print(f"  Could not fetch lights. Error: {e}")
+print("-" * 40)
+# ---------------------------------------
+
 # The ID for "Bedroom2" based on your earlier output
 BEDROOM_LIGHT_ID = 9 
 

@@ -13,10 +13,23 @@ class AudioDevice:
     def __str__(self):
         return f"{self.id} - {self.name} ({self.channels} channels)"
 
+
 class AudioSensor:
-    def __init__(self, use_agc=True, use_filter=False):
+    def __init__(self, use_agc=True):
+
+        # AGC Configuration
+        self.TARGET_LEVEL = 8000.0
+        self.ALPHA = 0.05
+        self.MAX_GAIN = 10.0
+        self.running_average = 0.0
+
+        # --- NEW: Transient Detection Configuration ---
+        self.on_transient_callback = None
+        self.previous_amplitude = 0.0
+        self.TRANSIENT_MULTIPLIER = 2.5 # How much louder than the previous chunk triggers a flash?
+        self.MIN_TRANSIENT_AMP = 1000 # Floor threshold to ignore background noise spikes
+
         self.USE_AGC = use_agc 
-        self.USE_FILTER = use_filter
 
         self._input_device = 1
         self._output_device = 0
@@ -24,8 +37,8 @@ class AudioSensor:
         # --- Configuration ---
         self.RATE = 44100
         self.CHUNK = 256
-        self.FREQ_MIN = 100
-        self.FREQ_MAX = 3000
+        self.FREQ_MIN = 1000
+        self.FREQ_MAX = 4000
         
         # AGC Configuration
         self.TARGET_LEVEL = 8000.0
@@ -40,50 +53,29 @@ class AudioSensor:
         self.window = np.hanning(self.CHUNK)
         self.WINDOW_CORRECTION = 2.0 
         
-        self.fft_freqs = np.fft.rfftfreq(self.CHUNK, d=1.0/self.RATE)
-        self._update_mask()
+        fft_freqs = np.fft.rfftfreq(self.CHUNK, d=1.0/self.RATE)
+        self.mask = (fft_freqs >= self.FREQ_MIN) & (fft_freqs <= self.FREQ_MAX)
         
         # --- PyAudio Setup ---
         self.p = pyaudio.PyAudio()
         
+        # Dynamically determine the correct number of channels
         try:
             default_device = self.p.get_default_input_device_info()
             self.CHANNELS = int(default_device.get('maxInputChannels', 1))
-            self.RATE = int(default_device.get('defaultSampleRate', 44100))
+            # Fallback if device reports 0 channels for some reason
             if self.CHANNELS < 1: self.CHANNELS = 1 
         except IOError:
             print("Error: No default audio input device found.")
             self.CHANNELS = 1
         
         self.stream = None
+
         self.running = True
         self.halted = False
-
-    def is_playing(self):
-        """Thread-safe check to see if the stream is active."""
-        try:
-            return self.stream is not None and self.stream.is_active()
-        except Exception:
-            return False
-
-    def _update_mask(self):
-        if self.USE_FILTER:
-            self.mask = (self.fft_freqs >= self.FREQ_MIN) & (self.fft_freqs <= self.FREQ_MAX)
-        else:
-            self.mask = np.ones_like(self.fft_freqs, dtype=bool)
-
-    def set_filter(self, use_filter: bool, freq_min: int, freq_max: int):
-        self.USE_FILTER = use_filter
-        self.FREQ_MIN = freq_min
-        self.FREQ_MAX = freq_max
-        self._update_mask()
-
-    def set_agc(self, use_agc: bool, target_level: float, max_gain: float, alpha: float):
-        self.USE_AGC = use_agc
-        self.TARGET_LEVEL = target_level
-        self.MAX_GAIN = max_gain
-        self.ALPHA = alpha
             
+        
+    
     def getDevices(self, in_out):
         input = False
         if (in_out == 'input'):
@@ -112,60 +104,7 @@ class AudioSensor:
 
     @input_device.setter
     def input_device(self, value):
-        if self._input_device == value:
-            return
-            
         self._input_device = value
-        
-        # If a stream exists, safely detach it to prevent race conditions
-        if getattr(self, 'stream', None) is not None:
-            old_stream = self.stream
-            self.stream = None # Nullify immediately so is_playing() returns False for other threads
-            
-            try:
-                is_active = old_stream.is_active()
-                old_stream.stop_stream()
-                old_stream.close()
-            except Exception:
-                is_active = False
-            
-            # Recalculate channels AND device-specific Sample Rate
-            try:
-                device_info = self.p.get_device_info_by_index(self._input_device)
-                self.CHANNELS = int(device_info.get('maxInputChannels', 1))
-                if self.CHANNELS < 1: self.CHANNELS = 1 
-                
-                # Dynamic sample rate prevents Errno -9986 on strict interfaces like Scarlett
-                self.RATE = int(device_info.get('defaultSampleRate', 44100))
-                
-                # We must recalculate the FFT frequencies since the sample rate changed
-                self.fft_freqs = np.fft.rfftfreq(self.CHUNK, d=1.0/self.RATE)
-                self._update_mask()
-                
-            except IOError:
-                self.CHANNELS = 1
-                self.RATE = 44100
-                
-            # Spin up the new stream
-            try:
-                new_stream = self.p.open(
-                    format=pyaudio.paInt16,
-                    channels=self.CHANNELS,
-                    rate=self.RATE,
-                    input=True,
-                    input_device_index=self._input_device,
-                    output=False,
-                    frames_per_buffer=self.CHUNK,
-                    stream_callback=self._process_audio 
-                )
-                
-                if not is_active:
-                    new_stream.stop_stream()
-                    
-                self.stream = new_stream # Safely mount the new stream
-                print(f"Switched to device {self._input_device} ({self.CHANNELS}ch, {self.RATE}Hz)")
-            except Exception as e:
-                print(f"Error opening audio device: {e}")
 
     @property
     def output_device(self):
@@ -179,21 +118,32 @@ class AudioSensor:
         self.input_device = input
 
     def _process_audio(self, in_data, frame_count, time_info, status):
+        # 1. Convert to floats
         audio_data = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
         
+        # 1b. Fix channel mismatch by converting stereo/multi-channel to mono
         if self.CHANNELS > 1:
             audio_data = audio_data.reshape(-1, self.CHANNELS).mean(axis=1)
 
+        # 2. Apply window and calculate FFT
         windowed_data = audio_data * self.window
         fft_data = np.fft.rfft(windowed_data)
 
-        if self.USE_FILTER:
-            magnitudes = np.abs(fft_data[self.mask]) * (2.0 / self.CHUNK) * self.WINDOW_CORRECTION
-        else:
-            magnitudes = np.abs(fft_data) * (2.0 / self.CHUNK) * self.WINDOW_CORRECTION
+        # 3. Apply mask, normalize, and correct for windowing
+        magnitudes = np.abs(fft_data[self.mask]) * (2.0 / self.CHUNK) * self.WINDOW_CORRECTION
 
+        # 4. Calculate raw acoustic energy
         band_amplitude = np.sqrt(np.sum(magnitudes**2)) if len(magnitudes) > 0 else 0.0
 
+        # --- NEW: TRANSIENT DETECTION ---
+        # If the current chunk is significantly louder than the last chunk, it's a beat/spike
+        if band_amplitude > self.MIN_TRANSIENT_AMP and band_amplitude > (self.previous_amplitude * self.TRANSIENT_MULTIPLIER):
+            if self.on_transient_callback:
+                self.on_transient_callback() # Fire the instant lighting override
+
+        self.previous_amplitude = band_amplitude
+
+        # --- 5. THE TOGGLE LOGIC (Unchanged) ---
         if self.USE_AGC:
             if self.running_average == 0.0:
                 self.running_average = band_amplitude 
@@ -209,6 +159,7 @@ class AudioSensor:
             normalized_amplitude = band_amplitude
             gain_display = " OFF "
 
+        # Pass data to the main thread instead of printing here
         self.current_display_data = {
             "amp": normalized_amplitude,
             "gain": gain_display
@@ -225,20 +176,18 @@ class AudioSensor:
             self.stream.start_stream()
 
     def start(self):
-        # Ensure we catch the initial rate/channels dynamically before start
+        # --- NEW: Dynamically update channels based on the selected device before starting ---
         try:
             device_info = self.p.get_device_info_by_index(self.input_device)
             self.CHANNELS = int(device_info.get('maxInputChannels', 1))
-            self.RATE = int(device_info.get('defaultSampleRate', 44100))
-            if self.CHANNELS < 1: self.CHANNELS = 1 
-            self.fft_freqs = np.fft.rfftfreq(self.CHUNK, d=1.0/self.RATE)
-            self._update_mask()
+            if self.CHANNELS < 1:
+                self.CHANNELS = 1 # Fallback to prevent 0-channel crash
         except IOError:
             self.CHANNELS = 1
+        # -----------------------------------------------------------------------------------
 
         mode = "ON" if self.USE_AGC else "OFF"
-        filter_mode = "ON" if self.USE_FILTER else "OFF"
-        print(f"* recording (AGC: {mode}, Filter: {filter_mode}, Channels: {self.CHANNELS}, Rate: {self.RATE}Hz) - Press Ctrl+C to stop")
+        print(f"* recording (AGC: {mode}, Channels: {self.CHANNELS}) - Press Ctrl+C to stop")
         
         self.stream = self.p.open(
             format=pyaudio.paInt16,
@@ -246,17 +195,21 @@ class AudioSensor:
             rate=self.RATE,
             input=True,
             input_device_index=self.input_device,
-            output=False,
+            output=False, # <-- SEE NOTE BELOW
+            # output_device_index=self.output_device, # <-- SEE NOTE BELOW
             frames_per_buffer=self.CHUNK,
             stream_callback=self._process_audio 
         )
 
         try:
+            # Main thread handles the UI/Printing
             while self.running:
-                if self.is_playing():
+                if self.stream.is_active():
                     data = self.current_display_data
                     meter_length = int(data["amp"] / 150)  
                     bar = '#' * meter_length
+                    
+                    print(f"\rGain: {data['gain']} | Amp: {data['amp']:8.2f} | {bar:<50}", end="", flush=True)
                     time.sleep(0.05) 
                 else:
                     time.sleep(0.1)
@@ -267,15 +220,12 @@ class AudioSensor:
             self.cleanup()
 
     def cleanup(self):
-        if getattr(self, 'stream', None) is not None:
-            try:
-                self.stream.stop_stream()
-                self.stream.close()
-            except Exception:
-                pass
+        self.stream.stop_stream()
+        self.stream.close()
         self.p.terminate()
 
 if __name__ == "__main__":
-    visualizer = AudioSensor(use_agc=True, use_filter=False) 
+    visualizer = AudioSensor(use_agc=True) 
     visualizer.getDevices('input')
     visualizer.start()
+    # visualizer.cleanup()
