@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from phue import Bridge
 from passthrough2 import AudioSensor, AudioDevice
+from pynput import keyboard
 
 class App(tk.Tk):
     def __init__(self, sensor: AudioSensor):
@@ -15,13 +16,39 @@ class App(tk.Tk):
         # --- Hue Bridge Configuration ---
         load_dotenv()
         self.bridge = Bridge(os.getenv("BRIDGE_IP"))
-        self.target_light_id = 9
-        self.last_brightness = -1
-        self.is_light_on = True
+        
+        # --- Multi-Light Configuration ---
+        # You can easily add more lights/keys to this list in the future
+        self.lights = [
+            {
+                "id": 9,
+                "trigger": "1",
+                "last_brightness": -1,
+                "is_on": True,
+                "smoothed_brightness": 0.0
+            },
+            {
+                "id": 10,
+                "trigger": "2",
+                "last_brightness": -1,
+                "is_on": True,
+                "smoothed_brightness": 0.0
+            }
+        ]
+
+        # Dynamic dictionary to track the held state of our triggers
+        self.key_states = {light["trigger"]: False for light in self.lights}
 
         # --- Smoothing & Averaging Trackers ---
-        self.smoothed_brightness = 0.0
         self.amp_buffer = []
+
+        # Start a background thread to listen to the keyboard globally
+        self.key_listener = keyboard.Listener(
+            on_press=self.on_global_key_press, 
+            on_release=self.on_global_key_release
+        )
+        self.key_listener.daemon = True # Closes automatically when you exit the app
+        self.key_listener.start()
 
         # --- Window Configuration ---
         self.title('Audio Lighting Passthrough')
@@ -55,6 +82,21 @@ class App(tk.Tk):
         self.poll_audio()
         self.update_meter()
         self.update_lights()
+
+    # --- Global Key Listeners ---
+    def on_global_key_press(self, key):
+        try:
+            if hasattr(key, 'char') and key.char in self.key_states:
+                self.key_states[key.char] = True
+        except Exception:
+            pass
+
+    def on_global_key_release(self, key):
+        try:
+            if hasattr(key, 'char') and key.char in self.key_states:
+                self.key_states[key.char] = False
+        except Exception:
+            pass
 
     def create_widgets(self):
         self.main_frame.columnconfigure(0, weight=1) 
@@ -206,70 +248,87 @@ class App(tk.Tk):
         self.sensor.set_agc(use_agc, target, max_gain, alpha)
 
     def poll_audio(self):
-        # We now use the safe wrapper to prevent crashes during hardware switching
         if self.sensor.is_playing():
+            # Constantly buffer the raw audio data
             amp = self.sensor.current_display_data.get("amp", 0)
             self.amp_buffer.append(amp)
         self.after(10, self.poll_audio)
 
     def update_meter(self):
-        amp = self.sensor.current_display_data.get("amp", 0)
+        # Visually kill the meter if NO triggers are pressed, show it if ANY are pressed
+        if any(self.key_states.values()):
+            amp = self.sensor.current_display_data.get("amp", 0)
+        else:
+            amp = 0
+            
         self.amp_meter['value'] = amp
         self.amp_meter['maximum'] = max(10000, self.upper_gate_var.get() + 2000)
         self.after(33, self.update_meter)
 
     def update_lights(self):
-        # Use safe wrapper here too
         if self.sensor.is_playing():
+            
+            # 1. Calculate the raw audio amplitude once per frame
             if self.amp_buffer:
-                amp = sum(self.amp_buffer) / len(self.amp_buffer)
+                raw_amp = sum(self.amp_buffer) / len(self.amp_buffer)
                 self.amp_buffer.clear() 
             else:
-                amp = self.sensor.current_display_data.get("amp", 0)
+                raw_amp = self.sensor.current_display_data.get("amp", 0)
 
             lower_gate = self.lower_gate_var.get()
             upper_gate = max(self.upper_gate_var.get(), lower_gate + 1)
+            alpha = max(0.01, 1.0 - (self.smoothing_var.get() / 100.0))
 
-            if amp < lower_gate:
-                if self.is_light_on:
-                    try:
-                        command = {'transitiontime': 4, 'on': False}
-                        threading.Thread(
-                            target=self.bridge.set_light, 
-                            args=(self.target_light_id, command), 
-                            daemon=True
-                        ).start()
-                        self.is_light_on = False
-                        self.last_brightness = 0 
-                        self.smoothed_brightness = 0.0 
-                    except Exception as e:
-                        print(f"Hue Error (Off): {e}")
-
-            else:
-                if amp >= upper_gate:
-                    target_brightness = 254
+            # 2. Iterate through each light and apply math independently
+            for light in self.lights:
+                
+                # If this specific light's key is pressed, give it the audio. Otherwise, silence.
+                if self.key_states.get(light["trigger"], False):
+                    amp = raw_amp
                 else:
-                    ratio = (amp - lower_gate) / (upper_gate - lower_gate)
-                    target_brightness = int(1 + ratio * 253)
+                    amp = 0
 
-                alpha = max(0.01, 1.0 - (self.smoothing_var.get() / 100.0))
-                self.smoothed_brightness = (alpha * target_brightness) + ((1.0 - alpha) * self.smoothed_brightness)
-                
-                brightness = int(self.smoothed_brightness)
-                brightness = max(1, min(254, brightness)) 
-                
-                if not self.is_light_on or abs(brightness - self.last_brightness) > 2:
-                    try:
-                        command = {'transitiontime': 2, 'bri': brightness, 'on': True}
-                        threading.Thread(
-                            target=self.bridge.set_light, 
-                            args=(self.target_light_id, command), 
-                            daemon=True
-                        ).start()
-                        self.last_brightness = brightness
-                        self.is_light_on = True
-                    except Exception as e:
-                        print(f"Hue Error (On/Dim): {e}")
+                # --- TURN OFF LOGIC ---
+                if amp < lower_gate:
+                    if light["is_on"]:
+                        try:
+                            command = {'transitiontime': 4, 'on': False}
+                            threading.Thread(
+                                target=self.bridge.set_light, 
+                                args=(light["id"], command), 
+                                daemon=True
+                            ).start()
+                            light["is_on"] = False
+                            light["last_brightness"] = 0 
+                            light["smoothed_brightness"] = 0.0 
+                        except Exception as e:
+                            print(f"Hue Error (Off): {e}")
+
+                # --- TURN ON / ADJUST LOGIC ---
+                else:
+                    if amp >= upper_gate:
+                        target_brightness = 254
+                    else:
+                        ratio = (amp - lower_gate) / (upper_gate - lower_gate)
+                        target_brightness = int(1 + ratio * 253)
+
+                    light["smoothed_brightness"] = (alpha * target_brightness) + ((1.0 - alpha) * light["smoothed_brightness"])
+                    
+                    brightness = int(light["smoothed_brightness"])
+                    brightness = max(1, min(254, brightness)) 
+                    
+                    if not light["is_on"] or abs(brightness - light["last_brightness"]) > 2:
+                        try:
+                            command = {'transitiontime': 2, 'bri': brightness, 'on': True}
+                            threading.Thread(
+                                target=self.bridge.set_light, 
+                                args=(light["id"], command), 
+                                daemon=True
+                            ).start()
+                            light["last_brightness"] = brightness
+                            light["is_on"] = True
+                        except Exception as e:
+                            print(f"Hue Error (On/Dim): {e}")
 
         self.after(100, self.update_lights)
 
