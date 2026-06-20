@@ -24,8 +24,8 @@ class AudioSensor:
         # --- Configuration ---
         self.RATE = 44100
         self.CHUNK = 256
-        self.FREQ_MIN = 500
-        self.FREQ_MAX = 5000
+        self.FREQ_MIN = 1000
+        self.FREQ_MAX = 4000
         
         # AGC Configuration
         self.TARGET_LEVEL = 8000.0
@@ -155,16 +155,27 @@ class AudioSensor:
             self.stream.start_stream()
 
     def start(self):
+        # --- NEW: Dynamically update channels based on the selected device before starting ---
+        try:
+            device_info = self.p.get_device_info_by_index(self.input_device)
+            self.CHANNELS = int(device_info.get('maxInputChannels', 1))
+            if self.CHANNELS < 1:
+                self.CHANNELS = 1 # Fallback to prevent 0-channel crash
+        except IOError:
+            self.CHANNELS = 1
+        # -----------------------------------------------------------------------------------
+
         mode = "ON" if self.USE_AGC else "OFF"
         print(f"* recording (AGC: {mode}, Channels: {self.CHANNELS}) - Press Ctrl+C to stop")
+        
         self.stream = self.p.open(
             format=pyaudio.paInt16,
             channels=self.CHANNELS,
             rate=self.RATE,
             input=True,
             input_device_index=self.input_device,
-            output=True,
-            output_device_index=self.output_device,
+            output=False, # <-- SEE NOTE BELOW
+            # output_device_index=self.output_device, # <-- SEE NOTE BELOW
             frames_per_buffer=self.CHUNK,
             stream_callback=self._process_audio 
         )
@@ -172,7 +183,6 @@ class AudioSensor:
         try:
             # Main thread handles the UI/Printing
             while self.running:
-                # Only update the UI/Math if the stream is currently active
                 if self.stream.is_active():
                     data = self.current_display_data
                     meter_length = int(data["amp"] / 150)  
@@ -181,7 +191,6 @@ class AudioSensor:
                     print(f"\rGain: {data['gain']} | Amp: {data['amp']:8.2f} | {bar:<50}", end="", flush=True)
                     time.sleep(0.05) 
                 else:
-                    # If paused, just sleep to prevent locking up the CPU
                     time.sleep(0.1)
                 
         except KeyboardInterrupt:
