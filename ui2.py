@@ -1,11 +1,14 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import threading
 import os
-from dotenv import load_dotenv
-from phue import Bridge
-from passthrough2 import AudioSensor, AudioDevice
+import sys
+import json
 from pynput import keyboard
+from phue import Bridge, PhueRegistrationException
+from passthrough2 import AudioSensor, AudioDevice
+
+CONFIG_FILE = "config.json"
 
 class App(tk.Tk):
     def __init__(self, sensor: AudioSensor):
@@ -13,47 +16,18 @@ class App(tk.Tk):
 
         self.sensor = sensor
 
-        # --- Hue Bridge Configuration ---
-        load_dotenv()
-        self.bridge = Bridge(os.getenv("BRIDGE_IP"))
-        
-        # --- Multi-Light Configuration ---
-        # You can easily add more lights/keys to this list in the future
-        self.lights = [
-            {
-                "id": 9,
-                "trigger": "1",
-                "last_brightness": -1,
-                "is_on": True,
-                "smoothed_brightness": 0.0
-            },
-            {
-                "id": 10,
-                "trigger": "2",
-                "last_brightness": -1,
-                "is_on": True,
-                "smoothed_brightness": 0.0
-            }
-        ]
-
-        # Dynamic dictionary to track the held state of our triggers
-        self.key_states = {light["trigger"]: False for light in self.lights}
-
-        # --- Smoothing & Averaging Trackers ---
-        self.amp_buffer = []
-
-        # Start a background thread to listen to the keyboard globally
-        self.key_listener = keyboard.Listener(
-            on_press=self.on_global_key_press, 
-            on_release=self.on_global_key_release
-        )
-        self.key_listener.daemon = True # Closes automatically when you exit the app
-        self.key_listener.start()
-
         # --- Window Configuration ---
         self.title('Audio Lighting Passthrough')
-        self.geometry('450x850')
-        self.minsize(350, 500) 
+        self.geometry('450x950')
+        self.minsize(400, 600) 
+
+        # --- Core Trackers ---
+        self.bridge = None
+        self.lights = []
+        self.key_states = {}
+        self.amp_buffer = []
+        self.current_frame = None
+        self.key_listener = None
         
         # --- Variables for Gates & Smoothing ---
         self.lower_gate_var = tk.DoubleVar(value=300.0)
@@ -71,30 +45,158 @@ class App(tk.Tk):
         self.agc_max_var = tk.DoubleVar(value=10.0)
         self.agc_alpha_var = tk.DoubleVar(value=5.0) 
 
-        # --- Main Layout ---
+        # Kick off the connection check!
+        self.check_connection()
+
+    # ==========================================
+    # --- STARTUP & CONNECTION LOGIC ---
+    # ==========================================
+
+    def load_ip(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                    return data.get("BRIDGE_IP")
+            except Exception:
+                pass
+        return None
+
+    def save_ip(self, ip):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump({"BRIDGE_IP": ip}, f)
+
+    def check_connection(self):
+        ip = self.load_ip()
+        if ip:
+            try:
+                self.bridge = Bridge(ip)
+                self.bridge.connect() 
+                self.init_main_app()
+            except PhueRegistrationException:
+                self.show_setup_screen("Your bridge was found, but this app isn't authorized! Press the physical link button on the bridge, then click Connect.")
+            except Exception as e:
+                self.show_setup_screen(f"Saved IP failed. Is the bridge online? ({e})")
+        else:
+            self.show_setup_screen("Enter your Philips Hue Bridge IP Address to get started.")
+
+    def show_setup_screen(self, msg):
+        if self.current_frame:
+            self.current_frame.destroy()
+            
+        self.current_frame = ttk.Frame(self, padding="20")
+        self.current_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(self.current_frame, text="Hue Bridge Setup", font=('Helvetica', 16, 'bold')).pack(pady=(20, 10))
+        ttk.Label(self.current_frame, text=msg, wraplength=350, justify="center").pack(pady=10)
+        
+        self.ip_var = tk.StringVar(value=self.load_ip() or "")
+        ttk.Entry(self.current_frame, textvariable=self.ip_var, font=('Helvetica', 12), justify="center").pack(pady=10)
+        
+        ttk.Label(
+            self.current_frame, 
+            text="Note: If this is your first time connecting, you MUST press the large round button on top of your Hue Bridge before clicking Connect.", 
+            wraplength=350, justify="center", foreground="gray"
+        ).pack(pady=20)
+        
+        ttk.Button(self.current_frame, text="Connect", command=self.on_connect_click).pack(pady=10)
+
+    def on_connect_click(self):
+        ip = self.ip_var.get().strip()
+        if not ip:
+            return
+            
+        try:
+            self.bridge = Bridge(ip)
+            self.bridge.connect()
+            self.save_ip(ip) 
+            self.init_main_app()
+        except PhueRegistrationException:
+            messagebox.showwarning("Bridge Link Required", "Please press the physical link button on your Hue Bridge, then try again.")
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Could not connect to bridge at {ip}.\n\nEnsure the IP is correct and your computer is on the same network.")
+
+    def init_main_app(self):
+        if self.current_frame:
+            self.current_frame.destroy()
+
+        try:
+            bridge_lights = self.bridge.get_light_objects('id')
+        except Exception as e:
+            print(f"Hue Connection Error: {e}")
+            bridge_lights = {}
+            
+        for l_id, l_obj in bridge_lights.items():
+            trigger_val = ""
+            if l_id == 9: trigger_val = "1"
+            if l_id == 10: trigger_val = "2"
+            
+            var = tk.StringVar(value=trigger_val)
+            var.trace_add('write', lambda *args, light_id=l_id, v=var: self.on_binding_change(light_id, v))
+            
+            self.lights.append({
+                "id": l_id,
+                "name": l_obj.name,
+                "trigger": trigger_val,
+                "last_brightness": -1,
+                "is_on": True,
+                "smoothed_brightness": 0.0,
+                "var": var
+            })
+            
+        self.rebuild_key_states()
+
+        # Start the global keyboard listener cleanly as a daemon thread
+        self.key_listener = keyboard.Listener(
+            on_press=self.on_global_key_press, 
+            on_release=self.on_global_key_release
+        )
+        self.key_listener.daemon = True 
+        self.key_listener.start()
+
         self.main_frame = ttk.Frame(self, padding="20")
         self.main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # --- Initialize UI ---
         self.create_widgets()
 
-        # Start the update loops
         self.poll_audio()
         self.update_meter()
         self.update_lights()
 
-    # --- Global Key Listeners ---
+    # ==========================================
+    # --- MAIN APP LOGIC ---
+    # ==========================================
+
+    def on_binding_change(self, light_id, var):
+        new_trigger = var.get().strip().lower() 
+        for light in self.lights:
+            if light["id"] == light_id:
+                light["trigger"] = new_trigger
+                break
+        self.rebuild_key_states()
+
+    def rebuild_key_states(self):
+        new_states = {}
+        for light in self.lights:
+            t = light["trigger"]
+            if t and t != "on":
+                new_states[t] = self.key_states.get(t, False) 
+        self.key_states = new_states
+
     def on_global_key_press(self, key):
         try:
-            if hasattr(key, 'char') and key.char in self.key_states:
-                self.key_states[key.char] = True
+            if hasattr(key, 'char') and key.char:
+                char = key.char.lower()
+                if char in self.key_states:
+                    self.key_states[char] = True
         except Exception:
             pass
 
     def on_global_key_release(self, key):
         try:
-            if hasattr(key, 'char') and key.char in self.key_states:
-                self.key_states[key.char] = False
+            if hasattr(key, 'char') and key.char:
+                char = key.char.lower()
+                if char in self.key_states:
+                    self.key_states[char] = False
         except Exception:
             pass
 
@@ -150,7 +252,7 @@ class App(tk.Tk):
         self.amp_meter.grid(row=1, column=1, rowspan=4, padx=(10, 0), sticky="ns")
 
         self.filter_frame = ttk.LabelFrame(self.main_frame, text="Frequency Filter", padding="10")
-        self.filter_frame.grid(row=5, column=0, columnspan=2, pady=(20, 0), sticky="ew")
+        self.filter_frame.grid(row=5, column=0, columnspan=2, pady=(15, 0), sticky="ew")
         self.filter_frame.columnconfigure(1, weight=1)
 
         self.filter_toggle = ttk.Checkbutton(
@@ -234,6 +336,30 @@ class App(tk.Tk):
         )
         self.agc_alpha_slider.grid(row=3, column=1, sticky="ew", padx=(10, 0))
 
+        self.bindings_outer_frame = ttk.LabelFrame(self.main_frame, text="Light Bindings (Scrollable)", padding="5")
+        self.bindings_outer_frame.grid(row=8, column=0, columnspan=2, pady=(15, 0), sticky="ew")
+
+        self.canvas = tk.Canvas(self.bindings_outer_frame, height=120, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self.bindings_outer_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        for i, light in enumerate(self.lights):
+            ttk.Label(self.scrollable_frame, text=f"ID {light['id']}: {light['name']}").grid(row=i, column=0, sticky="w", padx=5, pady=2)
+            ttk.Entry(self.scrollable_frame, textvariable=light['var'], width=5).grid(row=i, column=1, sticky="w", padx=10, pady=2)
+
     def on_filter_update(self, *args):
         use_filter = self.use_filter_var.get()
         f_min = int(self.freq_min_var.get())
@@ -249,14 +375,14 @@ class App(tk.Tk):
 
     def poll_audio(self):
         if self.sensor.is_playing():
-            # Constantly buffer the raw audio data
             amp = self.sensor.current_display_data.get("amp", 0)
             self.amp_buffer.append(amp)
         self.after(10, self.poll_audio)
 
     def update_meter(self):
-        # Visually kill the meter if NO triggers are pressed, show it if ANY are pressed
-        if any(self.key_states.values()):
+        any_always_on = any(light["trigger"] == "on" for light in self.lights)
+        
+        if any_always_on or any(self.key_states.values()):
             amp = self.sensor.current_display_data.get("amp", 0)
         else:
             amp = 0
@@ -268,7 +394,6 @@ class App(tk.Tk):
     def update_lights(self):
         if self.sensor.is_playing():
             
-            # 1. Calculate the raw audio amplitude once per frame
             if self.amp_buffer:
                 raw_amp = sum(self.amp_buffer) / len(self.amp_buffer)
                 self.amp_buffer.clear() 
@@ -279,16 +404,19 @@ class App(tk.Tk):
             upper_gate = max(self.upper_gate_var.get(), lower_gate + 1)
             alpha = max(0.01, 1.0 - (self.smoothing_var.get() / 100.0))
 
-            # 2. Iterate through each light and apply math independently
             for light in self.lights:
+                trigger = light["trigger"]
                 
-                # If this specific light's key is pressed, give it the audio. Otherwise, silence.
-                if self.key_states.get(light["trigger"], False):
+                if not trigger:
+                    continue
+
+                if trigger == "on":
+                    amp = raw_amp
+                elif self.key_states.get(trigger, False):
                     amp = raw_amp
                 else:
                     amp = 0
 
-                # --- TURN OFF LOGIC ---
                 if amp < lower_gate:
                     if light["is_on"]:
                         try:
@@ -304,7 +432,6 @@ class App(tk.Tk):
                         except Exception as e:
                             print(f"Hue Error (Off): {e}")
 
-                # --- TURN ON / ADJUST LOGIC ---
                 else:
                     if amp >= upper_gate:
                         target_brightness = 254
